@@ -2056,80 +2056,63 @@ bool exec_needs_mount_namespace(
         return false;
 }
 
-static int setup_private_users(uid_t ouid, gid_t ogid, uid_t uid, gid_t gid) {
-        _cleanup_free_ char *uid_map = NULL, *gid_map = NULL;
-        _cleanup_close_pair_ int errno_pipe[2] = { -1, -1 };
-        _cleanup_close_ int unshare_ready_fd = -1;
-        _cleanup_(sigkill_waitp) pid_t pid = 0;
-        uint64_t c = 1;
-        ssize_t n;
+typedef struct PrivateUsersSetupInfo {
+        int errno_pipe[2];
+        int unshare_ready_fd;
+        pid_t child_pid;
+} PrivateUsersSetupInfo;
+
+static int setup_private_users_prepare(uid_t ouid, gid_t ogid, uid_t uid, gid_t gid, PrivateUsersSetupInfo *setup_info) {
         int r;
+
+        /* initialize setup_info, just to be clean (plus this is actually necessary for errno_pipe) */
+        setup_info->errno_pipe[0] = -1;
+        setup_info->errno_pipe[1] = -1;
+        setup_info->unshare_ready_fd = -1;
+        setup_info->child_pid = 0;
 
         /* Set up a user namespace and map the original UID/GID (IDs from before any user or group changes, i.e.
          * the IDs from the user or system manager(s)) to itself, the selected UID/GID to itself, and everything else to
          * nobody. In order to be able to write this mapping we need CAP_SETUID in the original user namespace, which
-         * we however lack after opening the user namespace. To work around this we fork() a temporary child process,
-         * which waits for the parent to create the new user namespace while staying in the original namespace. The
-         * child then writes the UID mapping, under full privileges. The parent waits for the child to finish and
+         * we however lack after opening the user namespace. In addition, we need access to /proc, which isn't guaranteed
+         * to be present in the new mount namespace. To work around this, this function fork()s a temporary child process,
+         * which waits for the parent to create all relevant namespaces, while staying in the original namespace.
+         * The parent then calls setup_private_users_finish(), which sets up the user namespace and notifies the child, which
+         * then writes the UID mapping, under full privileges. The parent waits for the child to finish and
          * continues execution normally.
          * For unprivileged users (i.e. without capabilities), the root to root mapping is excluded. As such, it
          * does not need CAP_SETUID to write the single line mapping to itself. */
 
-        /* Can only set up multiple mappings with CAP_SETUID. */
-        if (have_effective_cap(CAP_SETUID) && uid != ouid && uid_is_valid(uid))
-                r = asprintf(&uid_map,
-                             UID_FMT " " UID_FMT " 1\n"     /* Map $OUID → $OUID */
-                             UID_FMT " " UID_FMT " 1\n",    /* Map $UID → $UID */
-                             ouid, ouid, uid, uid);
-        else
-                r = asprintf(&uid_map,
-                             UID_FMT " " UID_FMT " 1\n",    /* Map $OUID → $OUID */
-                             ouid, ouid);
-
-        if (r < 0)
-                return -ENOMEM;
-
-        /* Can only set up multiple mappings with CAP_SETGID. */
-        if (have_effective_cap(CAP_SETGID) && gid != ogid && gid_is_valid(gid))
-                r = asprintf(&gid_map,
-                             GID_FMT " " GID_FMT " 1\n"     /* Map $OGID → $OGID */
-                             GID_FMT " " GID_FMT " 1\n",    /* Map $GID → $GID */
-                             ogid, ogid, gid, gid);
-        else
-                r = asprintf(&gid_map,
-                             GID_FMT " " GID_FMT " 1\n",    /* Map $OGID -> $OGID */
-                             ogid, ogid);
-
-        if (r < 0)
-                return -ENOMEM;
-
         /* Create a communication channel so that the parent can tell the child when it finished creating the user
          * namespace. */
-        unshare_ready_fd = eventfd(0, EFD_CLOEXEC);
-        if (unshare_ready_fd < 0)
+        setup_info->unshare_ready_fd = eventfd(0, EFD_CLOEXEC);
+        if (setup_info->unshare_ready_fd < 0)
                 return -errno;
 
         /* Create a communication channel so that the child can tell the parent a proper error code in case it
          * failed. */
-        if (pipe2(errno_pipe, O_CLOEXEC) < 0)
+        if (pipe2(setup_info->errno_pipe, O_CLOEXEC) < 0)
                 return -errno;
 
-        r = safe_fork("(sd-userns)", FORK_RESET_SIGNALS|FORK_DEATHSIG, &pid);
+        r = safe_fork("(sd-userns)", FORK_RESET_SIGNALS|FORK_DEATHSIG, &setup_info->child_pid);
         if (r < 0)
                 return r;
         if (r == 0) {
+
+                _cleanup_free_ char *uid_map = NULL, *gid_map = NULL;
                 _cleanup_close_ int fd = -1;
                 const char *a;
                 pid_t ppid;
+                uint64_t c = 1;
 
                 /* Child process, running in the original user namespace. Let's update the parent's UID/GID map from
                  * here, after the parent opened its own user namespace. */
 
                 ppid = getppid();
-                errno_pipe[0] = safe_close(errno_pipe[0]);
+                setup_info->errno_pipe[0] = safe_close(setup_info->errno_pipe[0]);
 
                 /* Wait until the parent unshared the user namespace */
-                if (read(unshare_ready_fd, &c, sizeof(c)) < 0) {
+                if (read(setup_info->unshare_ready_fd, &c, sizeof(c)) < 0) {
                         r = -errno;
                         goto child_fail;
                 }
@@ -2152,6 +2135,34 @@ static int setup_private_users(uid_t ouid, gid_t ogid, uid_t uid, gid_t gid) {
 
                         fd = safe_close(fd);
                 }
+
+                /* Can only set up multiple mappings with CAP_SETUID. */
+                if (have_effective_cap(CAP_SETUID) && uid != ouid && uid_is_valid(uid))
+                        r = asprintf(&uid_map,
+                                     UID_FMT " " UID_FMT " 1\n"     /* Map $OUID → $OUID */
+                                     UID_FMT " " UID_FMT " 1\n",    /* Map $UID → $UID */
+                                     ouid, ouid, uid, uid);
+                else
+                        r = asprintf(&uid_map,
+                                     UID_FMT " " UID_FMT " 1\n",    /* Map $OUID → $OUID */
+                                     ouid, ouid);
+
+                if (r < 0)
+                        return -ENOMEM;
+
+                /* Can only set up multiple mappings with CAP_SETGID. */
+                if (have_effective_cap(CAP_SETGID) && gid != ogid && gid_is_valid(gid))
+                        r = asprintf(&gid_map,
+                                     GID_FMT " " GID_FMT " 1\n"     /* Map $OGID → $OGID */
+                                     GID_FMT " " GID_FMT " 1\n",    /* Map $GID → $GID */
+                                     ogid, ogid, gid, gid);
+                else
+                        r = asprintf(&gid_map,
+                                     GID_FMT " " GID_FMT " 1\n",    /* Map $OGID -> $OGID */
+                                     ogid, ogid);
+
+                if (r < 0)
+                        return -ENOMEM;
 
                 /* First write the GID map */
                 a = procfs_file_alloca(ppid, "gid_map");
@@ -2181,11 +2192,39 @@ static int setup_private_users(uid_t ouid, gid_t ogid, uid_t uid, gid_t gid) {
                 _exit(EXIT_SUCCESS);
 
         child_fail:
-                (void) write(errno_pipe[1], &r, sizeof(r));
+                (void) write(setup_info->errno_pipe[1], &r, sizeof(r));
                 _exit(EXIT_FAILURE);
         }
 
-        errno_pipe[1] = safe_close(errno_pipe[1]);
+        setup_info->errno_pipe[1] = safe_close(setup_info->errno_pipe[1]);
+
+        return 0;
+}
+
+static int setup_private_users_finish(PrivateUsersSetupInfo *setup_info) {
+        /* move these values into local scope for cleanup */
+        _cleanup_close_pair_ int errno_pipe[2] = { setup_info->errno_pipe[0], setup_info->errno_pipe[1] };
+        _cleanup_close_ int unshare_ready_fd = setup_info->unshare_ready_fd;
+        _cleanup_(sigkill_waitp) pid_t pid = setup_info->child_pid;
+        uint64_t c = 1;
+        ssize_t n;
+        int r;
+
+        /* remove the values from setup_info, we're taking care of them now */
+        setup_info->errno_pipe[0] = -1;
+        setup_info->errno_pipe[1] = -1;
+        setup_info->unshare_ready_fd = -1;
+        setup_info->child_pid = 0;
+
+        /* Set up a user namespace and map the original UID/GID (IDs from before any user or group changes, i.e.
+         * the IDs from the user or system manager(s)) to itself, the selected UID/GID to itself, and everything else to
+         * nobody. In order to be able to write this mapping we need CAP_SETUID in the original user namespace, which
+         * we however lack after opening the user namespace. To work around this we fork() a temporary child process,
+         * which waits for the parent to create the new user namespace while staying in the original namespace. The
+         * child then writes the UID mapping, under full privileges. The parent waits for the child to finish and
+         * continues execution normally.
+         * For unprivileged users (i.e. without capabilities), the root to root mapping is excluded. As such, it
+         * does not need CAP_SETUID to write the single line mapping to itself. */
 
         if (unshare(CLONE_NEWUSER) < 0)
                 return -errno;
@@ -3685,7 +3724,12 @@ static int exec_child(
         char **final_argv = NULL;
         dev_t journal_stream_dev = 0;
         ino_t journal_stream_ino = 0;
-        bool userns_set_up = false;
+        bool userns_requires_finish = false;
+        PrivateUsersSetupInfo private_users_setup_info = {
+                { -1, -1 },
+                -1,
+                0
+        };
         bool needs_sandboxing,          /* Do we need to set up full sandboxing? (i.e. all namespacing, all MAC stuff, caps, yadda yadda */
                 needs_setuid,           /* Do we need to do the actual setresuid()/setresgid() calls? */
                 needs_mount_namespace,  /* Do we need to set up a mount namespace for this kernel? */
@@ -4165,16 +4209,27 @@ static int exec_child(
                 }
         }
 
-        if (needs_sandboxing && context->private_users && !have_effective_cap(CAP_SYS_ADMIN)) {
-                /* If we're unprivileged, set up the user namespace first to enable use of the other namespaces.
-                 * Users with CAP_SYS_ADMIN can set up user namespaces last because they will be able to
-                 * set up the all of the other namespaces (i.e. network, mount, UTS) without a user namespace. */
-
-                userns_set_up = true;
-                r = setup_private_users(saved_uid, saved_gid, uid, gid);
+        if (needs_sandboxing && context->private_users) {
+                r = setup_private_users_prepare(saved_uid, saved_gid, uid, gid, &private_users_setup_info);
                 if (r < 0) {
                         *exit_status = EXIT_USER;
-                        return log_unit_error_errno(unit, r, "Failed to set up user namespacing for unprivileged user: %m");
+                        return log_unit_error_errno(unit, r, "Failed to set up user namespacing: %m");
+                }
+
+                if (!have_effective_cap(CAP_SYS_ADMIN)) {
+                        /* If we're unprivileged, finish setting up the user namespace first to enable use of the other namespaces.
+                         * Users with CAP_SYS_ADMIN can set up user namespaces last because they will be able to
+                         * set up the all of the other namespaces (i.e. network, mount, UTS) without a user namespace. */
+
+                        userns_requires_finish = false;
+                        r = setup_private_users_finish(&private_users_setup_info);
+                        if (r < 0) {
+                                *exit_status = EXIT_USER;
+                                return log_unit_error_errno(unit, r, "Failed to set up user namespacing for unprivileged user: %m");
+                        }
+                }
+                else {
+                        userns_requires_finish = true;
                 }
         }
 
@@ -4247,8 +4302,8 @@ static int exec_child(
          * case of mount namespaces being less privileged when the mount point list is copied from a
          * different user namespace). */
 
-        if (needs_sandboxing && context->private_users && !userns_set_up) {
-                r = setup_private_users(saved_uid, saved_gid, uid, gid);
+        if (userns_requires_finish) {
+                r = setup_private_users_finish(&private_users_setup_info);
                 if (r < 0) {
                         *exit_status = EXIT_USER;
                         return log_unit_error_errno(unit, r, "Failed to set up user namespacing: %m");
