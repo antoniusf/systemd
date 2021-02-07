@@ -600,6 +600,10 @@ static int check_x_access(const char *path, int *ret_fd) {
                 return r;
 
         r = access_fd(fd, X_OK);
+        if (r == -ENOSYS) { /* proc doesn't exist, so check the path directly */
+                r = access(path, X_OK);
+                r = (r < 0) ? -errno : 0;
+        }
         if (r < 0)
                 return r;
 
